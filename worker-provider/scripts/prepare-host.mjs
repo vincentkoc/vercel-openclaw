@@ -32,12 +32,14 @@ try {
   const workerSnapshot = process.env.OPENCLAW_CODEX_SNAPSHOT;
   if (workerSnapshot) assert(/^snap_[A-Za-z0-9]+$/.test(workerSnapshot));
   const nativeSlack = process.env.OPENCLAW_NATIVE_SLACK_CONFIG ? JSON.parse(process.env.OPENCLAW_NATIVE_SLACK_CONFIG) : undefined;
+  const sessionTimeoutMs = Number(process.env.OPENCLAW_CODEX_SESSION_TIMEOUT_MS ?? 45 * 60_000);
+  assert(Number.isSafeInteger(sessionTimeoutMs) && sessionTimeoutMs >= 45 * 60_000 && sessionTimeoutMs <= 24 * 60 * 60_000, 'Session timeout must fit the selected plan: 45 minutes on Hobby, up to 24 hours on Pro');
   if (nativeSlack) assert(workerSnapshot && nativeSlack.channels?.length && nativeSlack.users?.length && nativeSlack.teamId, 'Native Slack requires prebuilt runtime and explicit test scope');
   const catalog = await fetchNativeCatalog(config.modelKey, config.model);
   const payload = { 'openclaw-poc.tgz': archive.bytes, 'package.json': installation.manifest, 'package-lock.json': installation.lock, [catalog.path.slice(BASE.length + 1)]: catalog.bytes };
   for (const dir of ['runtime', 'test/e2e', 'test/codex-e2e']) for (const name of readdirSync(join(ROOT, dir)).filter(name => name.endsWith('.mjs'))) payload[`${dir}/${name}`] = readFileSync(join(ROOT, dir, name));
   for (const path of ['package.json', 'package-lock.json', 'openclaw.plugin.json', 'assets/bootstrap.mjs', ...['index', 'provider', 'profile', 'journal', 'host-admission'].map(name => `dist/${name}.js`)]) payload[`provider/${path}`] = readFileSync(join(ROOT, path));
-  const descriptor = { config: { projectId: config.projectId, teamId: config.teamId, model: config.model, catalogPath: catalog.path, npmRegistry: policy.registry, npmAge: policy.minReleaseAgeDays, ...(workerSnapshot ? { workerSnapshot } : {}), ...(nativeSlack ? { nativeSlack } : {}) }, files: Object.fromEntries(Object.entries(payload).map(([path, content]) => [path, hash(content)])) };
+  const descriptor = { config: { projectId: config.projectId, teamId: config.teamId, model: config.model, catalogPath: catalog.path, npmRegistry: policy.registry, npmAge: policy.minReleaseAgeDays, sessionTimeoutMs, ...(workerSnapshot ? { workerSnapshot } : {}), ...(nativeSlack ? { nativeSlack } : {}) }, files: Object.fromEntries(Object.entries(payload).map(([path, content]) => [path, hash(content)])) };
   let manifest = Buffer.from(JSON.stringify(descriptor));
   let runtimeDigest = hash(manifest);
   payload['runtime-manifest.json'] = manifest;
@@ -45,7 +47,7 @@ try {
   const name = `ocw-connect-${receipt.data.runId}`;
   const tags = { owner: 'openclaw-connect-codex-v1', runtime: runtimeDigest };
   receipt.intent(name, tags);
-  box = await Sandbox.create({ ...config.credentials, name, tags, persistent: true, snapshotExpiration: 7 * 24 * 60 * 60_000, keepLastSnapshots: { count: 2 }, ...(workerSnapshot ? { source: { type: 'snapshot', snapshotId: workerSnapshot } } : { image: 'vercel/sandbox/node:26' }), timeout: 10 * 60_000, ports: [3000], networkPolicy: workerSnapshot ? 'deny-all' : { allow: { [new URL(policy.registry).hostname]: registryNetworkRules(policy.registry, authorization ? { registry: policy.registry, authorization } : undefined), '*': [] } } });
+  box = await Sandbox.create({ ...config.credentials, name, tags, persistent: true, snapshotExpiration: 7 * 24 * 60 * 60_000, keepLastSnapshots: { count: 2 }, ...(workerSnapshot ? { source: { type: 'snapshot', snapshotId: workerSnapshot } } : { image: 'vercel/sandbox/node:26' }), timeout: sessionTimeoutMs, ports: [3000], networkPolicy: workerSnapshot ? 'deny-all' : { allow: { [new URL(policy.registry).hostname]: registryNetworkRules(policy.registry, authorization ? { registry: policy.registry, authorization } : undefined), '*': [] } } });
   for (const [path, content] of Object.entries(payload)) await box.writeFiles([{ path: `${BASE}/${path}`, content }]);
   process.stdout.write(workerSnapshot ? 'STEP verify prebuilt runtime without network access\n' : 'STEP install pinned OpenClaw/Codex runtime\n');
   const installed = await box.runCommand(workerSnapshot

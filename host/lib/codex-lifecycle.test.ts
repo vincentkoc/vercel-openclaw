@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 const sdk = vi.hoisted(() => ({ get: vi.fn(), snapshot: vi.fn() }));
 vi.mock('@vercel/sandbox', () => ({ Sandbox: { get: sdk.get }, Snapshot: { get: sdk.snapshot } }));
-import { codexHostPolicy, codexRegistryEnvironment, finishCodexLifecycle, parseCodexReceipt, runCodexLifecycle, type CodexTurnReceipt } from './codex-lifecycle';
+import { codexHostPolicy, codexRegistryEnvironment, codexRuntimeWindow, finishCodexLifecycle, parseCodexReceipt, runCodexLifecycle, stopCodexSession, type CodexTurnReceipt } from './codex-lifecycle';
 
 const receipt: CodexTurnReceipt = { reply: 'done', sessionId: 'session', worktree: '/workspace', workerName: 'worker', runId: 'run', gatewayStopped: true, suspension: { status: 'ready', suspensionId: 'suspension', expiresAtMs: 5000 } };
 
@@ -15,7 +15,7 @@ describe('Codex host startup', () => {
     vi.restoreAllMocks();
     vi.spyOn(console, 'info').mockImplementation(() => {});
     vi.spyOn(console, 'error').mockImplementation(() => {});
-    Object.assign(process.env, { OPENCLAW_GATEWAY_TOKEN: 'private-gateway', OPENCLAW_CODEX_RUNTIME_DIGEST: digest, VERCEL_PROJECT_ID: 'project', VERCEL_TEAM_ID: 'team', AI_GATEWAY_API_KEY: 'private-model' });
+    Object.assign(process.env, { OPENCLAW_GATEWAY_TOKEN: 'private-gateway', OPENCLAW_CODEX_RUNTIME_DIGEST: digest, VERCEL_PROJECT_ID: 'project', VERCEL_TEAM_ID: 'team', AI_GATEWAY_API_KEY: 'private-model', OPENCLAW_CODEX_SLEEP_URL: 'https://host.example.org/api/codex/sleep' });
     const fresh = { ...receipt, suspension: { ...receipt.suspension, expiresAtMs: Date.now() + 120000 } };
     command = vi.fn(async (params: {cmd: string}) => ({ exitCode: 0, stdout: async () => params.cmd === 'node' ? `OPENCLAW_HOST_RESULT=${JSON.stringify(fresh)}` : '' }));
     stop = vi.fn(async () => {});
@@ -74,10 +74,11 @@ describe('Codex host startup', () => {
     await expect(runCodexLifecycle(options)).rejects.toThrow(/readiness/);
     expect(command).toHaveBeenCalledTimes(1);
   });
-  it('leaves time for stop and confirmation after a slow wake', async () => {
+  it('leaves cleanup time inside the host command budget after a slow wake', async () => {
     await runCodexLifecycle({ ...options, budget: { deadlineMs: Date.now() + 150000, replyReserveMs: 15000 } });
-    const params = command.mock.calls.find(([p]) => p.cmd === 'node')![0] as { timeoutMs?: number };
-    expect(params.timeoutMs).toBeLessThanOrEqual(70000);
+    const params = command.mock.calls.find(([p]) => p.cmd === 'node')![0] as { timeoutMs: number; env: Record<string, string> };
+    expect(params.timeoutMs).toBeLessThanOrEqual(135000);
+    expect(JSON.parse(params.env.OPENCLAW_HOST_INPUT).executionDeadlineMs).toBeLessThanOrEqual(Date.now() + 55000);
   });
   it('uses the full stop and confirmation reserve after a slow publication', async () => {
     let now = Date.now();
@@ -115,15 +116,48 @@ describe('Codex host startup', () => {
     expect(command.mock.calls.map(([p]) => p.cmd)).toEqual(['true', 'node']);
     expect(stop).not.toHaveBeenCalled();
   });
-  it('does not wake or clean up a VM already running on entry', async () => {
+  it('reuses a running VM without wake, stop or snapshot', async () => {
     sdk.get.mockResolvedValue(running);
-    await expect(runCodexLifecycle(options)).rejects.toThrow();
+    const warm = { ...receipt, gatewayStopped: false, suspension: undefined, platformSessionId: 'new-session', gatewayPid: 42, idleTimeoutMs: 2700000 };
+    command.mockImplementation(async params => ({ exitCode: 0, stdout: async () => params.cmd === 'node' ? `OPENCLAW_HOST_RESULT=${JSON.stringify(warm)}` : '' }));
+    expect((await runCodexLifecycle(options)).gatewayStopped).toBe(false);
+    expect(command.mock.calls.map(([p]) => p.cmd)).toEqual(['true', 'node']);
+    expect(sdk.get.mock.calls.every(([p]) => p.resume === false)).toBe(true);
+    expect(stop).not.toHaveBeenCalled();
+    expect(sdk.snapshot).not.toHaveBeenCalled();
+  });
+  it('retries a stopped gateway with a permanent resident fence after its old lease expires', async () => {
+    const sleep = { action: 'sleep', reason: 'idle', platformSessionId: 'new-session', runtimeDigest: digest, gatewayStopped: true, residentFenced: true, workerStopped: true, suspension: { status: 'ready', suspensionId: 'old-lease', expiresAtMs: 1 } };
+    command.mockResolvedValue({ exitCode: 0, stdout: async () => `OPENCLAW_HOST_RESULT=${JSON.stringify(sleep)}` });
+    sdk.get.mockReset().mockResolvedValueOnce(running).mockResolvedValueOnce(running).mockResolvedValueOnce({ ...running, status: 'stopped' });
+    const result = await stopCodexSession({ name: 'owned', platformSessionId: 'new-session', oidcToken: 'fresh' });
+    expect(result.action).toBe('sleep');
+    expect(stop).toHaveBeenCalledOnce();
+    expect(sdk.get.mock.calls.every(([p]) => p.resume === false)).toBe(true);
+  });
+  it('a stale sleep request cannot execute commands or stop a freshly resumed session', async () => {
+    sdk.get.mockResolvedValue(running);
+    expect((await stopCodexSession({ name: 'owned', platformSessionId: 'old-session', oidcToken: 'fresh' })).action).toBe('stale');
     expect(command).not.toHaveBeenCalled();
+    expect(stop).not.toHaveBeenCalled();
+  });
+  it('does not accept expired gateway leases without the permanent resident fence', async () => {
+    sdk.get.mockResolvedValue(running);
+    const sleep = { action: 'sleep', platformSessionId: 'new-session', runtimeDigest: digest, gatewayStopped: true, suspension: { status: 'ready', suspensionId: 'lease', expiresAtMs: 1 } };
+    command.mockResolvedValue({ exitCode: 0, stdout: async () => `OPENCLAW_HOST_RESULT=${JSON.stringify(sleep)}` });
+    await expect(stopCodexSession({ name: 'owned', platformSessionId: 'new-session', oidcToken: 'fresh' })).rejects.toThrow('fence');
     expect(stop).not.toHaveBeenCalled();
   });
 });
 
 describe('Codex sleep/wake receipt', () => {
+  it('a 130s setup plus 100s execution cannot outrun a 200s host command', () => {
+    const { executionDeadlineMs } = codexRuntimeWindow(200000, 0);
+    expect(executionDeadlineMs).toBe(120000);
+    expect(130000 + 100000).toBeGreaterThan(executionDeadlineMs);
+    expect(executionDeadlineMs + 80000).toBe(200000);
+    expect(() => codexRuntimeWindow(80000)).toThrow();
+  });
   it('does not post a duplicate after native Slack delivery', async () => {
     let published = false;
     await finishCodexLifecycle({ execute: async () => ({ ...receipt, nativeSlackDelivered: true }), publish: async () => { published = true; }, stop: async () => {}, isStopped: async () => true });

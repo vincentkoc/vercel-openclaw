@@ -39,7 +39,7 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: 'unauthorized' }, { status: 401 });
   }
   if (process.env.OPENCLAW_ENGINE === 'codex') {
-    return NextResponse.json({ action: 'none', reason: 'Codex lifecycle stops after each turn' });
+    return NextResponse.json({ action: 'none', reason: 'Codex resident owns the idle timer' });
   }
   const token = process.env.OPENCLAW_GATEWAY_TOKEN;
   if (!token) {

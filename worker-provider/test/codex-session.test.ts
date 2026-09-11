@@ -141,6 +141,30 @@ test('native channel turns are adopted only from one exact placement-bound launc
   await session.wait('native-run');
 });
 
+test('an abort during approval lookup cannot resolve a launch and still permits cleanup cancellation', async t => {
+  const controller = new AbortController();
+  const expected = { sessionKey: 'agent:main:codex-test', sessionId: 'session', runId: 'owned', environmentId: 'environment', nodeId: 'node', cwd: '/worker/project', ownerEpoch: 2, placementGeneration: 3 };
+  const peer = await fixture(t, (frame, reply) => {
+    if (frame.method === 'chat.send') return reply({ runId: 'owned' });
+    if (frame.method === 'chat.abort') return reply({ aborted: true, runIds: ['owned'] });
+    if (frame.method === 'plugin.approval.list') {
+      controller.abort(new Error('execution deadline'));
+      return reply([{ id: 'approval', approvalKind: 'plugin', expiresAtMs: Date.now() + 10000, request: {
+        pluginId: 'codex', severity: 'critical', sessionKey: expected.sessionKey, runId: expected.runId, allowedDecisions: ['allow-once'],
+        placementGrant: { ...expected, pluginId: 'codex', agentId: 'main', command: 'codex.exec-server.stdio.v1', approvalScope: 'codex.exec-server', pairingGeneration: 'pairing' },
+      } }]);
+    }
+    assert.fail(`unexpected ${frame.method}`);
+  });
+  const session = await connectTestOperator({ ...peer.options, signal: controller.signal });
+  t.after(() => session.close());
+  await session.send('test', 'owned');
+  await assert.rejects(session.approveLaunch(expected), /execution deadline/);
+  assert.equal(peer.requests.some((frame: any) => frame.method === 'plugin.approval.resolve'), false);
+  await session.cancel('owned');
+  assert.equal(peer.requests.at(-1).method, 'chat.abort');
+});
+
 test('native Slack uses the local SDK approval presenter without broadening the turn connection', async t => {
   const expected = { sessionKey: 'agent:main:codex-test', sessionId: 'session', environmentId: 'environment', nodeId: 'node', cwd: '/worker/project', ownerEpoch: 2, placementGeneration: 3 };
   const peer = await fixture(t);

@@ -1,6 +1,6 @@
 # OpenClaw on Vercel Sandbox
 
-A two-sandbox PoC for running OpenClaw with Codex, sleeping between Slack messages, and restoring its files on the next message. Start with the [setup and native Slack test](host/CODEX-POC.md).
+A two-sandbox PoC for running OpenClaw with Codex, staying warm between Slack messages, and sleeping after inactivity. Start with the [setup and native Slack test](host/CODEX-POC.md). The warm lifecycle has passed local tests; full Slack idle/wake verification remains pending. The earlier deployed tests covered per-message shutdown.
 
 ```text
 Slack → Vercel Connect → Vercel Function
@@ -8,15 +8,20 @@ Slack → Vercel Connect → Vercel Function
                      VM1: OpenClaw + Codex
                               ↓ native remote execution
                      VM2: generated commands
-                              ↓ workspace reconciliation
-                     VM1: drain → stop → disk snapshot
+                     stays warm between messages
+                              ↓ 45 minutes idle
+                     reconcile → suspend → disk snapshot
 ```
 
-VM1 runs the gateway and model/tool coordination. A fresh VM2 runs generated commands with gateway-only egress. This is a controller/code-execution split, not the earlier proposal to put the entire Codex engine in VM2. Returned project files are data; passing their tests does not make them trusted gateway software.
+VM1 runs the gateway and model/tool coordination. VM2 runs generated commands with gateway-only egress and is reused for follow-ups in the same conversation. Switching conversations reclaims that worker before allocating another. This is a controller/code-execution split, not the earlier proposal to put the entire Codex engine in VM2. Returned project files are data; passing their tests does not make them trusted gateway software.
 
-Connect forwards the full Slack payload and supplies the Slack app token. The host verifies the forwarded request, enforces the test allowlist, wakes VM1 and injects Slack/model credentials through the firewall. OpenClaw's native Slack listener handles the turn and posts the answer. Sandbox administration and gateway credentials remain in the trusted controller scope.
+Connect forwards the full Slack payload and supplies the Slack app token. The host verifies the forwarded request, enforces the test allowlist, wakes VM1 and injects Slack/model credentials through the firewall. OpenClaw receives the message and posts the answer. Sandbox administration and gateway credentials remain in the trusted controller scope.
 
-Both sandboxes stop between tasks. The next mention restores VM1's disk and restarts its processes. There is no third always-running VM or Workflow dependency.
+Completing a reply leaves both VMs running. The idle clock resets on accepted work and model/tool activity; an active turn blocks idle sleep. Health checks do not reset it. After 45 idle minutes, a resident timer calls the Vercel app, which obtains fresh credentials, rechecks activity under the same admission lock, reclaims VM2, uses OpenClaw's suspension handshake and stops/snapshots VM1. The next mention restores disk and starts fresh processes and a fresh clock. There is no third always-running VM or Workflow dependency.
+
+OpenClaw's pinned adapter still creates an isolated Codex app-server client for each paired-node turn and closes it afterward. This revision retains the VMs, gateway and worker enrollment; it does not override the harness's per-turn process ownership.
+
+[Hobby's 45-minute limit](https://vercel.com/docs/sandbox/pricing) applies to total session duration. A separate deadline check begins graceful shutdown before that limit, even if the idle interval has not elapsed. Pro/Enterprise can use a longer session limit to allow the full 45-minute idle interval after active work. The default five-minute cron was removed because [Hobby cron only runs daily](https://vercel.com/docs/cron-jobs/usage-and-pricing); the historical legacy path requires its own scheduler configuration.
 
 ## Try it
 
@@ -42,7 +47,7 @@ Compatibility is pinned to OpenClaw `2026.9.2` at `3928bad9badfcb6c7d140530435e8
 
 ## What has been demonstrated
 
-Native Slack mentions through Connect, code execution in VM2, same-thread file persistence across VM1 sleep/wake, distinct disposable workers, eyes reactions and stopped sandboxes. The host also sets Slack's processing status before runtime startup; API success is not proof of when Slack paints it.
+The earlier per-message-sleep revision demonstrated native Slack mentions through Connect, code execution in VM2, same-thread file persistence across VM1 sleep/wake, distinct disposable workers, eyes reactions and stopped sandboxes. Those runs do not verify the new warm lifecycle. The host also sets Slack's processing status before runtime startup; API success is not proof of when Slack paints it.
 
 September 10, 2026 observations took approximately **60–98 seconds** from mention to reply. In one 60-second greeting, about 8 seconds covered intake/wake/runtime checks, 9 seconds OpenClaw/Slack startup, 30 seconds worker preparation/connection and 13 seconds intake/agent/reply. VM2 allocation took 0.38 seconds within the worker-preparation period. VM1 restore was not isolated. These observations do not establish a consistent speedup or a latency benchmark.
 

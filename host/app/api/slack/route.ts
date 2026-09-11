@@ -203,8 +203,8 @@ async function handleCodexTurn(name: string, message: InboundSlackMessage, conte
       },
     });
     if (receipt.nativeSlackDelivered) delivered = true;
-    console.info(`codex lifecycle complete session=${receipt.sessionId} worker=${receipt.workerName} vm1=stopped`);
-    console.info('codex lifecycle receipt', JSON.stringify({ eventId: message.eventId, sessionId: receipt.sessionId, runId: receipt.runId, workerName: receipt.workerName, nativeSlackDelivered: receipt.nativeSlackDelivered === true, gatewayStopped: receipt.gatewayStopped, vm1Stopped: true, vm1SnapshotId: receipt.vm1SnapshotId, suspension: receipt.suspension, phases: receipt.phases }));
+    console.info(`codex lifecycle complete session=${receipt.sessionId} worker=${receipt.workerName} vm1=${receipt.gatewayStopped ? 'stopped' : 'warm'}`);
+    console.info('codex lifecycle receipt', JSON.stringify({ eventId: message.eventId, sessionId: receipt.sessionId, runId: receipt.runId, workerName: receipt.workerName, nativeSlackDelivered: receipt.nativeSlackDelivered === true, gatewayStopped: receipt.gatewayStopped, vm1Stopped: receipt.gatewayStopped, platformSessionId: receipt.platformSessionId, gatewayPid: receipt.gatewayPid, workerReused: receipt.workerReused, idleTimeoutMs: receipt.idleTimeoutMs, vm1SnapshotId: receipt.vm1SnapshotId, suspension: receipt.suspension, phases: receipt.phases }));
   } catch (error) {
     console.error('codex host failure', JSON.stringify({ eventId: message.eventId, phase: error instanceof CodexLifecycleError ? error.phase : 'slack-host', delivered, error: safeCodexError(error instanceof CodexLifecycleError ? error.cause : error) }));
     if (!delivered) {

@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { WorkerProviderError } from 'openclaw/plugin-sdk/plugin-entry';
 import { AllocationJournal } from '../src/journal.ts';
-import { createVercelWorkerProvider, type Box, type Client } from '../src/provider.ts';
+import { controllerToken, createVercelWorkerProvider, type Box, type Client } from '../src/provider.ts';
 import { allocationName, networkPolicy, OWNER, parseProfile, profileIntent } from '../src/profile.ts';
 
 const profile = { gatewayOrigin: 'https://gateway.example.org', projectId: 'prj_test', teamId: 'team_test', timeoutMs: 1_800_000 };
@@ -187,9 +187,15 @@ test('active replay never reinstalls code in an agent-modified worker', async ()
 });
 
 test('profile rejects credentials, arbitrary setup, private origins, and unbounded lifetime', () => {
-  for (const input of [{ ...profile, token: 'secret' }, { ...profile, setup: 'echo unsafe' }, { ...profile, gatewayOrigin: 'http://localhost' }, { ...profile, gatewayOrigin: 'https://127.0.0.1' }, { ...profile, timeoutMs: 86_400_000 }]) assert.throws(() => parseProfile(input));
+  for (const input of [{ ...profile, token: 'secret' }, { ...profile, setup: 'echo unsafe' }, { ...profile, gatewayOrigin: 'http://localhost' }, { ...profile, gatewayOrigin: 'https://127.0.0.1' }, { ...profile, timeoutMs: 86_400_001 }]) assert.throws(() => parseProfile(input));
+  assert.equal(parseProfile({ ...profile, timeoutMs: 86_400_000 }).timeoutMs, 86_400_000);
   const locked = networkPolicy(parseProfile(profile), false);
   assert.deepEqual(locked, { allow: { 'gateway.example.org': [{ transform: [{ headers: { Host: 'gateway.example.org' } }] }] } });
+});
+
+test('resident provider reads rotated credentials per operation and never falls back from a missing credential file', () => {
+  assert.equal(controllerToken({ VERCEL_OIDC_TOKEN: 'fresh' }), 'fresh');
+  assert.throws(() => controllerToken({ OPENCLAW_HOST_CREDENTIALS_PATH: '/missing/host-credentials.json', VERCEL_OIDC_TOKEN: 'stale' }));
 });
 
 test('prebuilt workers require an immutable image and never open registry egress', () => {

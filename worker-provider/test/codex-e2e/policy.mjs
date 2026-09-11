@@ -40,7 +40,7 @@ export function codexToolExclusions(toolNames = []) {
   return [...new Set(['exec', 'process', 'gateway', 'openclaw', ...toolNames.filter(name => name !== 'session_status')])].sort();
 }
 
-export function codexGatewayConfig({ origin, projectId, teamId, model, catalogPath, npmRegistry, npmAge = 2, excludedTools = [], workerImage, workerSnapshot, base = BASE }) {
+export function codexGatewayConfig({ origin, projectId, teamId, model, catalogPath, npmRegistry, npmAge = 2, excludedTools = [], workerImage, workerSnapshot, sessionTimeoutMs = 2700000, base = BASE }) {
   assert(posix.isAbsolute(catalogPath), 'Absolute native catalog path required');
   assert(!excludedTools.includes('session_status'), 'The test requires session_status');
   const ref = `vercel-ai-gateway/${model}`;
@@ -78,7 +78,7 @@ export function codexGatewayConfig({ origin, projectId, teamId, model, catalogPa
       models: [{ id: model, name: model, api: 'openai-responses', reasoning: true, input: ['text'], contextWindow: 32768, maxTokens: 2048 }],
     } } },
     cloudWorkers: { profiles: { vercel: { provider: 'vercel-worker', settings: {
-      gatewayOrigin: origin, projectId, teamId, timeoutMs: 2700000,
+      gatewayOrigin: origin, projectId, teamId, timeoutMs: sessionTimeoutMs,
       npmRegistry, npmMinReleaseAgeDays: npmAge, npmReleaseAgeExclusions: [],
       ...(workerImage ? { workerImage } : {}), ...(workerSnapshot ? { workerSnapshot } : {}),
     } } } },

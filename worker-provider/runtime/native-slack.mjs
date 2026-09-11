@@ -45,23 +45,35 @@ export async function waitForNativeSlack(rpc, { timeoutMs = 30_000, pause = () =
   throw new Error('Native Slack channel readiness deadline exceeded');
 }
 
-export function nativeSlackController({ input, path, secret, rpc, observe, fetcher = fetch, timeoutMs = 35_000 }) {
+export function nativeSlackController({ input, path, secret, rpc, observe, fetcher = fetch, timeoutMs = 35_000, signal }) {
+  const check = () => signal?.throwIfAborted();
+  const revoke = () => {
+    if (!existsSync(path)) return;
+    const admission = JSON.parse(readFileSync(path, 'utf8'));
+    if (admission.eventId === input.eventId) writeFileSync(path, JSON.stringify({ ...admission, expiresAt: 0 }), { mode: 0o600 });
+  };
   const events = () => existsSync(`${path}.events`) ? readFileSync(`${path}.events`, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)).filter(e => e.eventId === input.eventId) : [];
-  const wait = async check => {
+  const wait = async evaluate => {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      const result = await check();
+      check();
+      const result = await evaluate();
+      check();
       if (result) return result;
       await new Promise(resolve => setTimeout(resolve, 200));
     }
     throw new Error('Native Slack admission or delivery deadline exceeded');
   };
   return {
+    closeNativeTurn: revoke,
     async startNativeTurn(operator, expected) {
+      check();
       const live = (await rpc('sessions.describe', { key: input.sessionKey })).session;
+      check();
       assert.equal(live?.sessionId, expected.sessionId, 'Native Slack session changed before intake');
       writeFileSync(path, JSON.stringify({ ...input, rawBody: undefined, message: undefined, expiresAt: Date.now() + 180_000 }), { mode: 0o600 });
-      const response = await fetcher('http://127.0.0.1:18789/slack/events', { method: 'POST', headers: { 'content-type': 'application/json', ...signSlackBody(input.rawBody, secret) }, body: input.rawBody, redirect: 'error', signal: AbortSignal.timeout(15000) });
+      const response = await fetcher('http://127.0.0.1:18789/slack/events', { method: 'POST', headers: { 'content-type': 'application/json', ...signSlackBody(input.rawBody, secret) }, body: input.rawBody, redirect: 'error', signal: AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(15000)]) });
+      check();
       assert.equal(response.status, 200, 'Native Slack HTTP intake rejected the event');
       observe('native-intake');
       return wait(async () => {

@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 
-export async function prepareHostSleep({ rpc, requestId, now = Date.now, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), observe = () => {}, timeoutMs = 60_000 }) {
+export async function prepareHostSleep({ rpc, requestId, now = Date.now, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), observe = () => {}, timeoutMs = 60_000, drain = true }) {
   const deadline = now() + timeoutMs;
-  let result = await rpc('gateway.suspend.prepare', { requestId, terminalPolicy: 'preserve', drain: true });
+  let result = await rpc('gateway.suspend.prepare', { requestId, terminalPolicy: 'preserve', drain });
   const suspensionId = result.suspensionId;
   while (true) {
     observe(result);
@@ -34,7 +34,9 @@ export function visibleReply(history, runId) {
   return text;
 }
 
-export async function runRemoteTurn({ sessionKey, eventId, message, base, rpc, connectOperator, workerFor, saveSession, loadSession, startNativeTurn, awaitNativeDelivery, observe = () => {} }) {
+export async function runRemoteTurn({ sessionKey, eventId, message, base, rpc, connectOperator, workerFor, saveSession, loadSession, startNativeTurn, awaitNativeDelivery, closeNativeTurn, observe = () => {}, retained, keepWorker = false, signal }) {
+  const check = () => signal?.throwIfAborted();
+  check();
   assert(/^agent:main:(slack-[A-Z0-9]+|slack:(channel:[A-Z0-9]+|direct:[A-Z0-9]+)(:thread:[0-9]+\.[0-9]+)?|main)$/i.test(sessionKey), 'Invalid host session key');
   sessionKey = sessionKey.toLowerCase();
   assert(typeof eventId === 'string' && /^[A-Za-z0-9_-]{1,160}$/.test(eventId), 'Explicit event identity required');
@@ -50,19 +52,50 @@ export async function runRemoteTurn({ sessionKey, eventId, message, base, rpc, c
     assert(session.key === sessionKey && session.sessionId && session.worktree?.path, 'Missing managed session');
     await saveSession(sessionKey, session);
   }
-  let operator;
+  const withinDeadline = async operation => {
+    let abort;
+    try {
+      return await Promise.race([operation, new Promise((_, reject) => {
+        abort = () => reject(signal.reason ?? new Error('Turn deadline reached'));
+        signal?.addEventListener('abort', abort, { once: true });
+        if (signal?.aborted) abort();
+      })]);
+    } finally {
+      signal?.removeEventListener('abort', abort);
+    }
+  };
+  let operator, runId, cancellation;
+  const cancel = () => {
+    if (operator && runId) cancellation ??= operator.cancel(runId).catch(() => {});
+  };
+  signal?.addEventListener('abort', cancel, { once: true });
   observe('session-ready');
   let dispatched = false;
   try {
+    check();
+    assert(!retained || (keepWorker && retained.sessionKey === sessionKey), 'Cannot reuse a worker across conversations');
     dispatched = true;
-    const { placement } = await rpc('sessions.dispatch', { key: sessionKey, profileId: 'vercel' }, 180_000);
+    // Native reclaim cancels and drains an in-flight dispatch, so do not await provisioning past the deadline.
+    const { placement } = retained ?? await withinDeadline(rpc('sessions.dispatch', { key: sessionKey, profileId: 'vercel' }, 180_000));
+    check();
     assert(placement?.state === 'active', 'Worker placement is not active');
-    observe('worker-dispatched');
-    const worker = await workerFor(placement);
+    observe(retained ? 'worker-reused' : 'worker-dispatched');
+    const worker = await withinDeadline(workerFor(placement));
+    check();
     observe('worker-ready');
-    operator = await connectOperator(sessionKey);
+    operator = await withinDeadline(connectOperator(sessionKey).then(async connected => {
+      if (signal?.aborted) { await connected.close(); check(); }
+      return connected;
+    }));
+    check();
     const expected = { sessionKey, sessionId: session.sessionId, environmentId: placement.environmentId, nodeId: worker.nodeId, cwd: placement.remoteWorkspaceDir, ownerEpoch: placement.activeOwnerEpoch, placementGeneration: placement.generation };
-    const turn = startNativeTurn ? await startNativeTurn(operator, expected) : await operator.send(message, eventId);
+    const turn = startNativeTurn ? await startNativeTurn(operator, expected) : await withinDeadline(operator.send(message, eventId).then(async sent => {
+      if (signal?.aborted) { await operator.cancel(sent.runId).catch(() => {}); check(); }
+      return sent;
+    }));
+    runId = turn.runId;
+    if (signal?.aborted) cancel();
+    check();
     observe('turn-started');
     let finished = false;
     let approved = false;
@@ -72,21 +105,31 @@ export async function runRemoteTurn({ sessionKey, eventId, message, base, rpc, c
         if (!finished) await new Promise(resolve => setTimeout(resolve, 200));
       }
     })();
-    const completion = operator.wait(turn.runId).finally(() => { finished = true; });
+    const completion = withinDeadline(operator.wait(turn.runId)).finally(() => { finished = true; });
     // An approval failure must abort the pending turn, not leave a second unobserved promise.
     const approvalResult = approvals.catch(async error => { await operator.cancel(turn.runId).catch(() => {}); throw error; });
     const [result] = await Promise.all([completion, approvalResult]);
+    check();
     assert(approved && result.status === 'ok', 'Codex turn did not complete with its exact launch approval');
     observe('turn-completed');
     const reply = visibleReply(await operator.request('chat.history', { sessionKey, limit: 100 }), turn.runId);
+    check();
     if (awaitNativeDelivery) await awaitNativeDelivery();
+    check();
     observe('reply-delivered');
-    await rpc('sessions.reclaim', { key: sessionKey }, 60_000);
-    await worker.assertStopped();
+    if (!keepWorker) {
+      await rpc('sessions.reclaim', { key: sessionKey }, 60_000);
+      await worker.assertStopped();
+    }
     dispatched = false;
-    return { reply, sessionId: session.sessionId, worktree: session.worktree.path, workerName: worker.name, runId: turn.runId, ...(startNativeTurn ? { nativeSlackDelivered: true } : {}) };
+    return { reply, sessionId: session.sessionId, worktree: session.worktree.path, workerName: worker.name, workerWorkspace: placement.remoteWorkspaceDir, runId: turn.runId, workerReused: Boolean(retained), ...(keepWorker ? { retained: { sessionKey, placement, worker } } : {}), ...(startNativeTurn ? { nativeSlackDelivered: true } : {}) };
   } finally {
-    try { await operator?.close(); }
-    finally { if (dispatched) await rpc('sessions.reclaim', { key: sessionKey }, 60_000); }
+    signal?.removeEventListener('abort', cancel);
+    try { await closeNativeTurn?.(); }
+    finally {
+      await cancellation;
+      try { await operator?.close(); }
+      finally { if (dispatched) await rpc('sessions.reclaim', { key: sessionKey }, 60_000); }
+    }
   }
 }

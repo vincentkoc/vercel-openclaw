@@ -1,7 +1,25 @@
 import { describe, expect, it, vi } from 'vitest';
-import { admitCodexEvent } from './codex-admission';
+import { admitCodexEvent, claimCodexSleep } from './codex-admission';
 
 describe('Codex admission', () => {
+  it('sleep takes exactly the same VM lock and releases only its own lease', async () => {
+    const messageClient = { command: vi.fn().mockResolvedValue('accepted') };
+    await admitCodexEvent('sandbox', 'Ev123', messageClient);
+    const client = { command: vi.fn().mockResolvedValueOnce('OK').mockResolvedValueOnce(1) };
+    const sleep = await claimCodexSleep('sandbox', client);
+    const messageLock = messageClient.command.mock.calls[0][0][4];
+    expect(client.command.mock.calls[0][0]).toEqual(['SET', messageLock, expect.any(String), 'NX', 'EX', 360]);
+    expect(sleep.accepted).toBe(true);
+    await sleep.release();
+    expect(client.command.mock.calls[1][0].slice(2)).toEqual([1, messageLock, client.command.mock.calls[0][0][2]]);
+  });
+  it('sleep does not release or replace a busy turn lock', async () => {
+    const client = { command: vi.fn().mockResolvedValue(null) };
+    const sleep = await claimCodexSleep('sandbox', client);
+    expect(sleep.accepted).toBe(false);
+    await sleep.release();
+    expect(client.command).toHaveBeenCalledOnce();
+  });
   it('atomically claims the event and one sandbox lease, releasing only the owner', async () => {
     const command = vi.fn().mockResolvedValueOnce('accepted').mockResolvedValueOnce(1);
     const admitted = await admitCodexEvent('sandbox', 'Ev123', { command });

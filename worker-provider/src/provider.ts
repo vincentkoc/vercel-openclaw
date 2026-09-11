@@ -13,15 +13,22 @@ export type Client = {
   get(profile: Profile, name: string): Promise<Box>;
 };
 
+export function controllerToken(env: NodeJS.ProcessEnv = process.env): string {
+  const token = env.OPENCLAW_HOST_CREDENTIALS_PATH
+    ? JSON.parse(readFileSync(env.OPENCLAW_HOST_CREDENTIALS_PATH, 'utf8')).token
+    : env.VERCEL_TOKEN ?? env.VERCEL_OIDC_TOKEN;
+  if (typeof token !== 'string' || !token.trim()) throw new Error('A gateway-only Vercel credential is required.');
+  return token;
+}
+
 export function sdkClient(): Client {
   const credentials = (profile: Profile) => {
-    const token = process.env.VERCEL_TOKEN ?? process.env.VERCEL_OIDC_TOKEN;
-    if (!token) throw new Error('Set a gateway-only VERCEL_TOKEN or VERCEL_OIDC_TOKEN; no credentials are read from worker settings.');
+    const token = controllerToken();
     return { token, projectId: profile.projectId, teamId: profile.teamId };
   };
   return {
     checkCredentials() {
-      if (!process.env.VERCEL_TOKEN && !process.env.VERCEL_OIDC_TOKEN) throw new Error('A gateway-only Vercel credential is required before allocation.');
+      controllerToken();
     },
     create: (profile, name, intent, signal) => Sandbox.create({
       ...credentials(profile), name, ...(profile.workerSnapshot ? { source: { type: 'snapshot' as const, snapshotId: profile.workerSnapshot } } : { image: profile.workerImage ?? 'vercel/sandbox/node:26' }),

@@ -97,3 +97,213 @@ test('changed session identity fails before dispatching any code', async () => {
   }), /identity changed/);
   assert.deepEqual(methods, ['sessions.describe']);
 });
+
+test('warm follow-ups retain VM2, but still attest it and obtain exact per-turn approvals', async () => {
+  const calls: string[] = [];
+  let saved: any;
+  const session = { key: 'agent:main:slack-c123', sessionId: 'session', worktree: { path: '/worktree' } };
+  const placement = { state: 'active', environmentId: 'env', remoteWorkspaceDir: '/remote', activeOwnerEpoch: 1, generation: 1 };
+  const worker = { name: 'one-worker', nodeId: 'one-node', assertStopped: async () => { calls.push('stopped'); } };
+  const options = { sessionKey: session.key, message: 'hello', base: '/runtime', keepWorker: true,
+    loadSession: async () => saved, saveSession: async (_: string, value: any) => { saved = value; },
+    rpc: async (method: string) => {
+      calls.push(method);
+      if (method === 'sessions.describe') return { session: saved };
+      if (method === 'sessions.create') return session;
+      if (method === 'sessions.dispatch') return { placement };
+      if (method === 'sessions.reclaim') return {};
+      throw new Error(method);
+    },
+    workerFor: async () => { calls.push('attest'); return worker; },
+    connectOperator: async () => ({ send: async () => ({ runId: 'run' }), wait: async () => { await new Promise(resolve => setTimeout(resolve, 5)); return { status: 'ok' }; },
+      approveLaunch: async (binding: any) => { assert.equal(binding.nodeId, worker.nodeId); calls.push('approve'); return true; },
+      request: async () => ({ messages: [terminal('run', 'done')] }), close: async () => {}, cancel: async () => {} }),
+  };
+  const first = await runRemoteTurn({ ...options, eventId: 'Ev1' });
+  const second = await runRemoteTurn({ ...options, eventId: 'Ev2', retained: first.retained });
+  assert.equal(first.workerName, second.workerName);
+  assert.equal(second.workerReused, true);
+  assert.equal(calls.filter(c => c === 'sessions.dispatch').length, 1);
+  assert.equal(calls.filter(c => c === 'attest').length, 2);
+  assert.equal(calls.filter(c => c === 'approve').length, 2);
+  assert(!calls.includes('sessions.reclaim'));
+  await assert.rejects(runRemoteTurn({ ...options, eventId: 'Ev3', retained: { ...first.retained, sessionKey: 'another-thread' } }), /across conversations/);
+});
+
+test('an execution deadline cancels the exact run and reclaims its worker instead of reporting a warm success', async () => {
+  const controller = new AbortController();
+  const calls: string[] = [];
+  let saved: any;
+  const session = { key: 'agent:main:main', sessionId: 'session', worktree: { path: '/worktree' } };
+  const options = { sessionKey: session.key, eventId: 'Ev1', message: 'run', base: '/runtime', keepWorker: true, signal: controller.signal,
+    loadSession: async () => saved, saveSession: async (_: string, value: any) => { saved = value; },
+    rpc: async (method: string) => {
+      calls.push(method);
+      if (method === 'sessions.describe') return { session: saved };
+      if (method === 'sessions.create') return session;
+      if (method === 'sessions.dispatch') return { placement: { state: 'active', environmentId: 'env' } };
+      if (method === 'sessions.reclaim') return {};
+      throw new Error(method);
+    },
+    workerFor: async () => ({ name: 'worker', nodeId: 'node' }),
+    connectOperator: async () => ({ send: async () => ({ runId: 'exact-run' }),
+      wait: async () => { controller.abort(new Error('deadline')); await new Promise(() => {}); return { status: 'cancelled' }; },
+      cancel: async (runId: string) => { calls.push(`cancel:${runId}`); },
+      approveLaunch: async () => false, close: async () => { calls.push('close'); },
+    }),
+  };
+  await assert.rejects(runRemoteTurn(options), /deadline/);
+  assert(calls.includes('cancel:exact-run'));
+  assert.equal(calls.at(-1), 'sessions.reclaim');
+});
+
+test('a deadline interrupts pending dispatch and waits for native reclaim to finish', async () => {
+  for (const cleanupFails of [false, true]) {
+    const controller = new AbortController();
+    const calls: string[] = [];
+    const session = { key: 'agent:main:main', sessionId: 'session', worktree: { path: '/worktree' } };
+    let finishDispatch!: (value: any) => void, rejectDispatch!: (error: Error) => void;
+    const dispatch = new Promise((resolve, reject) => { finishDispatch = resolve; rejectDispatch = reject; });
+    let finishCleanup!: () => void;
+    const cleanup = new Promise<void>(resolve => { finishCleanup = resolve; });
+    let settled = false;
+    const result = runRemoteTurn({ sessionKey: session.key, eventId: 'Ev1', message: 'run', base: '/runtime', keepWorker: true, signal: controller.signal,
+      loadSession: async () => session,
+      rpc: async (method: string) => {
+        calls.push(method);
+        if (method === 'sessions.describe') return { session };
+        if (method === 'sessions.dispatch') { controller.abort(new Error('host deadline')); return await dispatch; }
+        if (method === 'sessions.reclaim') {
+          rejectDispatch(new Error('native provisioning cancelled'));
+          await cleanup;
+          if (cleanupFails) throw new Error('native cleanup failed');
+          calls.push('cleanup-finished');
+          return { placement: { state: 'local' } };
+        }
+        throw new Error(method);
+      },
+      workerFor: async () => { assert.fail('must not attest or launch a turn after dispatch cancellation'); },
+      connectOperator: async () => { assert.fail('must not launch an operator after dispatch cancellation'); },
+    }).then(value => { settled = true; return value; }, error => { settled = true; throw error; });
+    const rejected = assert.rejects(result, cleanupFails ? /native cleanup failed/ : /host deadline/);
+    try {
+      await new Promise(resolve => setImmediate(resolve));
+      assert.deepEqual(calls, ['sessions.describe', 'sessions.dispatch', 'sessions.reclaim']);
+      assert.equal(settled, false, 'caller must wait until native cancellation and cleanup settle');
+    } finally {
+      finishDispatch({ placement: { state: 'active' } });
+      finishCleanup();
+      await rejected;
+    }
+    assert.equal(calls.includes('cleanup-finished'), !cleanupFails);
+  }
+});
+
+test('a deadline reached during session setup never dispatches a worker', async () => {
+  const controller = new AbortController();
+  const calls: string[] = [];
+  const session = { key: 'agent:main:main', sessionId: 'session', worktree: { path: '/worktree' } };
+  await assert.rejects(runRemoteTurn({ sessionKey: session.key, eventId: 'Ev1', message: 'run', base: '/runtime', signal: controller.signal,
+    loadSession: async () => session,
+    rpc: async (method: string) => {
+      calls.push(method);
+      controller.abort(new Error('setup deadline'));
+      return { session };
+    },
+  }), /setup deadline/);
+  assert.deepEqual(calls, ['sessions.describe']);
+});
+
+test('a deadline starts reclaim without waiting for worker attestation or launching an operator', async () => {
+  const controller = new AbortController();
+  const calls: string[] = [];
+  const session = { key: 'agent:main:main', sessionId: 'session', worktree: { path: '/worktree' } };
+  let finishAttestation!: () => void;
+  const attestation = new Promise<void>(resolve => { finishAttestation = resolve; });
+  const result = runRemoteTurn({ sessionKey: session.key, eventId: 'Ev1', message: 'run', base: '/runtime', signal: controller.signal,
+    loadSession: async () => session,
+    rpc: async (method: string) => {
+      calls.push(method);
+      if (method === 'sessions.describe') return { session };
+      if (method === 'sessions.dispatch') return { placement: { state: 'active' } };
+      if (method === 'sessions.reclaim') return {};
+      throw new Error(method);
+    },
+    workerFor: async () => { controller.abort(new Error('attestation deadline')); await attestation; return {}; },
+    connectOperator: async () => { assert.fail('must not launch an operator after attestation cancellation'); },
+  });
+  const rejected = assert.rejects(result, /attestation deadline/);
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(calls.at(-1), 'sessions.reclaim');
+  } finally {
+    finishAttestation();
+    await rejected;
+  }
+});
+
+test('a late operator connection is closed after deadline cleanup, without sending a turn', async () => {
+  const controller = new AbortController();
+  const calls: string[] = [];
+  const session = { key: 'agent:main:main', sessionId: 'session', worktree: { path: '/worktree' } };
+  let finishConnection!: (value: any) => void;
+  const connection = new Promise(resolve => { finishConnection = resolve; });
+  const result = runRemoteTurn({ sessionKey: session.key, eventId: 'Ev1', message: 'run', base: '/runtime', signal: controller.signal,
+    loadSession: async () => session,
+    rpc: async (method: string) => {
+      calls.push(method);
+      if (method === 'sessions.describe') return { session };
+      if (method === 'sessions.dispatch') return { placement: { state: 'active' } };
+      if (method === 'sessions.reclaim') return {};
+      throw new Error(method);
+    },
+    workerFor: async () => ({}),
+    connectOperator: async () => { controller.abort(new Error('connection deadline')); return await connection; },
+    closeNativeTurn: () => { calls.push('revoke'); },
+  });
+  const rejected = assert.rejects(result, /connection deadline/);
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(calls.slice(-2), ['revoke', 'sessions.reclaim']);
+  } finally {
+    finishConnection({ close: async () => { calls.push('late-close'); }, send: async () => { assert.fail('late connection must not start a turn'); } });
+    await rejected;
+  }
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls.at(-1), 'late-close');
+});
+
+test('a late non-native run identity is cancelled while cleanup does not wait for its acknowledgement', async () => {
+  const controller = new AbortController();
+  const calls: string[] = [];
+  const session = { key: 'agent:main:main', sessionId: 'session', worktree: { path: '/worktree' } };
+  let acknowledge!: (value: any) => void;
+  const sent = new Promise(resolve => { acknowledge = resolve; });
+  const result = runRemoteTurn({ sessionKey: session.key, eventId: 'Ev1', message: 'run', base: '/runtime', signal: controller.signal,
+    loadSession: async () => session,
+    rpc: async (method: string) => {
+      calls.push(method);
+      if (method === 'sessions.describe') return { session };
+      if (method === 'sessions.dispatch') return { placement: { state: 'active' } };
+      if (method === 'sessions.reclaim') return {};
+      throw new Error(method);
+    },
+    workerFor: async () => ({}),
+    connectOperator: async () => ({
+      send: async () => { controller.abort(new Error('submission deadline')); return await sent; },
+      cancel: async (runId: string) => { calls.push(`cancel:${runId}`); },
+      close: async () => { calls.push('close'); },
+      approveLaunch: async () => { assert.fail('no approval after cancellation'); },
+    }),
+  });
+  const rejected = assert.rejects(result, /submission deadline/);
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(calls.slice(-2), ['close', 'sessions.reclaim']);
+  } finally {
+    acknowledge({ runId: 'late-owned-run' });
+    await rejected;
+  }
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls.at(-1), 'cancel:late-owned-run');
+});

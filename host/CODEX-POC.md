@@ -2,9 +2,11 @@
 
 Slack → Connect → Vercel Function → VM1 (OpenClaw + Codex) → VM2 (generated commands).
 
-The host forwards the full Slack event to OpenClaw's native listener. Both the host and OpenClaw apply explicit channel/user policy. The local approval client has only `operator.approvals`; the controller permits the exact session/run/worker/command-bound native exec-server launch once. VM2 has gateway-only egress. Reconciled project files return to VM1 as data.
+The host forwards the full Slack event to OpenClaw. Both apply explicit channel/user policy. The local approval client has only `operator.approvals`; the controller permits the exact session/run/worker/command-bound native exec-server launch once. VM2 has gateway-only egress. Reconciled project files return to VM1 as data.
 
-After native delivery and VM2 reclamation, the runtime calls `gateway.suspend.prepare` with `drain: true` and `terminalPolicy: "preserve"`. It polls the same lease for up to 60 seconds, honoring `retryAfterMs`, and exits only with readiness, no blockers and at least 15 seconds remaining. The Function stops VM1 and clears eyes/status. The next mention restores disk and restarts processes.
+After a reply, eyes/status clear and both VMs stay running. Same-thread messages reuse the gateway and worker; a new thread reclaims the old worker first. A private resident service holds the active-work guard and resets the idle clock on work. At 45 minutes idle it calls `/api/codex/sleep`. The Function verifies a session-bound capability, takes the same Redis lock as incoming messages, obtains fresh OIDC and asks the resident to recheck activity and prepare sleep. Only a ready OpenClaw suspension and confirmed current-session snapshot count as successful sleep. The next message restores disk, starts new processes and resets the clock.
+
+This lifecycle revision is locally tested, not yet verified in a new deployed Slack run. Rebuild VM1 with the updated provider and runtime; an old runtime digest cannot run the new host protocol.
 
 ## Prerequisites
 
@@ -47,12 +49,14 @@ This installs once into `openclaw-foundation/openclaw/openclaw@sha256:30134c3d14
 
 ```sh
 export OPENCLAW_E2E_RESULTS_DIR=/absolute/private/path/new-host-results
+# Pro/Enterprise only. Omit on Hobby, whose maximum total session is 45 minutes.
+export OPENCLAW_CODEX_SESSION_TIMEOUT_MS=86400000
 node scripts/prepare-host.mjs
 ```
 
 Expected marker: `CODEX_HOST_PREPARED`. Preserve the receipt's `name` and `runtimeDigest`. It registers the official Slack plugin, prepares the guarded tool catalog and leaves VM1 stopped, without a model turn or Slack message. The host refuses to silently replace missing saved state.
 
-The one-time builder stops before VM1 preparation. During a message, there is VM1 plus a fresh VM2, with no third always-running VM.
+The one-time builder stops before VM1 preparation. During work there is VM1 plus one VM2, with no third always-running VM. Both have the prepared session limit. Hobby defaults to 45 minutes total. Shutdown begins three minutes before that ceiling; a new turn requires an additional 235-second execution budget and otherwise rolls over first. Activity cannot extend the platform limit. Use a longer Pro/Enterprise session for the full 45-minute idle test below. OpenClaw's paired-node adapter owns a separate Codex client per turn; this revision does not change that upstream behavior.
 
 ## 3. Configure and deploy host/
 
@@ -66,6 +70,7 @@ Deploy `host/` as the project's Root Directory with:
 | `OPENCLAW_ALLOWED_SLACK_USERS` | Same human Slack IDs, comma-separated; empty fails closed |
 | `OPENCLAW_CODEX_SANDBOX_NAME` | Prepared receipt's `name` |
 | `OPENCLAW_CODEX_RUNTIME_DIGEST` | Prepared receipt's `runtimeDigest` |
+| `OPENCLAW_CODEX_SLEEP_URL` | Public HTTPS URL ending `/api/codex/sleep`; defaults to the production project URL |
 | `OPENCLAW_GATEWAY_TOKEN` | Strong random gateway credential from your secret store |
 | `SLACK_CONNECTOR` | Existing connector UID, e.g. `slack/openclaw` |
 | `AI_GATEWAY_API_KEY` | Approved testing key |
@@ -86,18 +91,21 @@ Attach the chosen connector to the intended deployment environment:
 vercel connect attach slack/openclaw --environment production --triggers --trigger-path /api/slack
 ```
 
-Invite the app to the allowed test channel. Ensure it has app-mention delivery, `chat:write`, `reactions:write`, `channels:history`, `channels:read` and `users:read`; the observer also requests `reactions:read`. Deployment protection must admit Connect's forwarded request. Avoid duplicate production/preview destinations.
+Invite the app to the allowed test channel. Ensure it has app-mention delivery, `chat:write`, `reactions:write`, `channels:history`, `channels:read` and `users:read`; the observer also requests `reactions:read`. Deployment protection must admit Connect's forwarded request and the authenticated sleep callback. The callback sends the latest project OIDC token through `x-vercel-trusted-oidc-idp-token`; [Trusted Sources](https://vercel.com/docs/deployment-protection/methods-to-bypass-deployment-protection/trusted-sources) allows same-project, same-environment access by default. Keep that rule if customizing Trusted Sources, and use a callback URL in the host's deployment environment. The session-bound capability still authenticates the application endpoint. A blocked callback cannot stop/snapshot a VM gracefully. Avoid duplicate production/preview destinations.
+
+Codex mode does not need Cron or Workflow. `vercel.json` no longer installs the historical five-minute cron, which is unavailable on Hobby. Users of the legacy non-Codex path must explicitly configure `/api/cron/idle-check` on a supported plan.
 
 Slack/model credentials are injected by VM1's firewall, not stored in the guest. A localhost relay removes the Slack SDK's placeholder body token before forwarding to the fixed Slack API origin. Sandbox administration and gateway credentials remain in trusted controller scope. Connect verification proves project/environment OIDC, not an exact connector identity.
 
 ## 4. Native Slack test
 
-`npm run test:e2e:slack` observes and verifies two native turns. It never sends messages, creates VMs or resumes them itself. You send mentions through Slack; the deployed host performs the normal lifecycle. `test:e2e:host` is an older text-bridge fixture and must not target a native-Slack VM.
+`npm run test:e2e:slack` observes three native turns with an idle period after the warm follow-up. It never sends messages, creates VMs or resumes them itself. You send mentions through Slack; the deployed host performs the lifecycle. `test:e2e:host` is a historical per-turn-stop fixture and does not verify this revision.
 
 Create a new short thread in the allowed channel (an ordinary message without mentioning the bot is enough). In a fresh private `OPENCLAW_E2E_RESULTS_DIR`, save `fixture.json`, replacing IDs, timestamp and public test value:
 
 ```json
 {
+  "mode": "idle",
   "channel": "CEXAMPLE",
   "user": "UEXAMPLE",
   "bot": "UBOT",
@@ -106,7 +114,8 @@ Create a new short thread in the allowed channel (an ordinary message without me
   "value": "spruce-826",
   "cases": [
     { "label": "write", "role": "write" },
-    { "label": "read", "role": "read" }
+    { "label": "warm", "role": "read" },
+    { "label": "wake", "role": "read" }
   ]
 }
 ```
@@ -120,10 +129,16 @@ npm run test:e2e:slack -- observe write
 Wait for `OBSERVER_ARMED`, then paste its printed prompt into that thread, replacing the placeholder with an actual mention of your bot. Send exactly one mention. Wait for `OBSERVATION_COMPLETE write`, then:
 
 ```sh
-npm run test:e2e:slack -- observe read
+npm run test:e2e:slack -- observe warm
 ```
 
-Again wait for `OBSERVER_ARMED` and send its prompt in the same thread. It omits the saved value. Wait for `OBSERVATION_COMPLETE read`. From the linked `host/` directory, export that deployment's Function logs for the test interval (set `DEPLOYMENT_URL` and `TEST_STARTED_AT` to your deployment and ISO start time):
+Again wait for `OBSERVER_ARMED` and send its prompt in the same thread. It omits the saved value. Wait for `OBSERVATION_COMPLETE warm`. Both VMs should still be running. Then leave the conversation idle and run:
+
+```sh
+npm run test:e2e:slack -- idle
+```
+
+Wait for `IDLE_SLEEP_OBSERVED` after the full idle interval. The observer uses platform metadata only and does not wake the VM. Then run `npm run test:e2e:slack -- observe wake` and send its prompt after `OBSERVER_ARMED`. Wait for `OBSERVATION_COMPLETE wake`. From the linked `host/` directory, export that deployment's Function logs for the test interval (set `DEPLOYMENT_URL` and `TEST_STARTED_AT` to your deployment and ISO start time):
 
 ```sh
 vercel logs "$DEPLOYMENT_URL" --since "$TEST_STARTED_AT" --json --limit 100 > "$OPENCLAW_E2E_RESULTS_DIR/requests.jsonl"
@@ -135,7 +150,7 @@ The verifier accepts request objects containing `logs` or individual log objects
 npm run test:e2e:slack -- verify
 ```
 
-Success prints `NATIVE_SLACK_TWO_TURN_SLEEP_WAKE_PASS`. It requires the exact printed prompts, sequential absence-then-matching-file observations in the write turn's VM session, unique native admission/delivery and host completion, expected replies, independent matching file hashes, the same OpenClaw session with different VM sessions/workers, ready suspension without blockers, current-session snapshots, eyes appearing/clearing, and independently stopped VM1/workers. File creation ordering uses read order, not comparisons between host and gateway clocks.
+Success prints `NATIVE_SLACK_WARM_IDLE_WAKE_PASS`. It requires exact prompts, unique admission/delivery and completion, matching file hashes, the same VM1 session/gateway PID/worker for the warm follow-up, an idle-triggered stop and current-session snapshot, and restored files in a fresh VM session/worker on wake. A hard-deadline stop or an accelerated interval cannot pass as 45-minute inactivity. The final wake deliberately leaves the VMs warm; allow another idle period to observe final cleanup. Fixtures without `mode: "idle"` remain available only to verify historical per-turn-stop evidence.
 
 Missing evidence fails. A timeout does not prove cleanup; inspect exact resources and host logs before retrying. Observation files cannot be overwritten; use a fresh directory/thread after a failed run. The observer reads only the running platform session, never sandbox-level filesystem reads that can wake a stopped VM. Use a short thread and honor Slack's rate-limit delay. Evidence contains Slack text and runtime IDs: keep it private.
 
@@ -145,7 +160,7 @@ September 10 native tests demonstrated Connect delivery, VM2 command execution, 
 
 The [root README](../README.md#limits) lists product limits. Same-thread recall may use Slack history; it does not prove disk-only model memory. Cross-thread memory is disabled. No durable post-ack queue, crash recovery, scheduled wake or OAuth-expiry test is included. VM1 remains trusted with broad outbound access. This is not an adversarial security certification.
 
-VM1 sessions have a ten-minute timeout, snapshots expire after seven days and retain two, and host turns have a 235-second runtime cap inside a 300-second Function budget. Connect supplies event forwarding and tokens; the host owns process restart, reconciliation and sleep.
+VM sessions default to 45 minutes total; Pro/Enterprise preparation can select up to 24 hours. Snapshots expire after seven days and retain two. Host turns have a 235-second execution cap, shortened by the remaining Function budget to reserve cleanup time. Connect supplies event forwarding and tokens; the host owns process restart, reconciliation and sleep.
 
 ### Existing dependency audit findings
 

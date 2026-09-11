@@ -9,7 +9,8 @@ const TURN_TIMEOUT = 120_000;
 const METHODS = new Set(['health', 'environments.status', 'chat.history']);
 const EVENTS = new Set(['connect.challenge', 'agent', 'chat', 'tick', 'presence', 'health', 'shutdown']);
 
-export async function connectTestOperator({ url, token, sessionKey, requestTimeoutMs = 10_000, connectTimeoutMs = 10_000, localApprovals = false, createApprovalClient = createOperatorApprovalsGatewayClient }) {
+export async function connectTestOperator({ url, token, sessionKey, requestTimeoutMs = 10_000, connectTimeoutMs = 10_000, localApprovals = false, createApprovalClient = createOperatorApprovalsGatewayClient, signal }) {
+  signal?.throwIfAborted();
   let address;
   try { address = new URL(url); }
   catch { throw new Error('Invalid Gateway URL'); }
@@ -85,7 +86,7 @@ export async function connectTestOperator({ url, token, sessionKey, requestTimeo
     onGap: () => fail('Gateway event sequence gap'),
   });
   const timer = setTimeout(() => fail('Gateway connection timeout'), connectTimeoutMs);
-  try { client.start(); await ready; }
+  try { client.start(); await ready; signal?.throwIfAborted(); }
   catch (error) { await client.stopAndWait(); throw error; }
   finally { clearTimeout(timer); }
 
@@ -107,8 +108,10 @@ export async function connectTestOperator({ url, token, sessionKey, requestTimeo
         onClose: () => { if (!closing) fail('Local approval presenter closed'); },
       });
       if (failure) throw failure;
+      signal?.throwIfAborted();
       approvalClient.start();
       await approvalReady;
+      signal?.throwIfAborted();
     } catch (error) {
       closing = true;
       await Promise.all([client.stopAndWait(), approvalClient?.stopAndWait()]);
@@ -142,9 +145,11 @@ export async function connectTestOperator({ url, token, sessionKey, requestTimeo
       return call(method, params);
     },
     async approveLaunch(expected) {
+      signal?.throwIfAborted();
       const turn = owned(expected.runId);
       assert.equal(expected.sessionKey, sessionKey, 'Cannot approve another session');
       const decision = exactLaunchApproval(await call('plugin.approval.list', {}), expected);
+      signal?.throwIfAborted();
       if (!decision) return false;
       assert(!turn.launchDecisionSent, 'Unexpected second exec-server launch during one attempt');
       turn.launchDecisionSent = true;

@@ -24,8 +24,8 @@ export function parseProfile(input: WorkerProfile): Profile {
     throw new WorkerProviderError('Explicit Vercel projectId and teamId are required for stable lifecycle routing.');
   }
   const timeoutMs = input.timeoutMs ?? 2_700_000;
-  if (typeof timeoutMs !== 'number' || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1_200_000 || timeoutMs > 3_600_000) {
-    throw new WorkerProviderError('timeoutMs must be between 20 and 60 minutes.');
+  if (typeof timeoutMs !== 'number' || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1_200_000 || timeoutMs > 86_400_000) {
+    throw new WorkerProviderError('timeoutMs must be between 20 minutes and 24 hours, within the selected Vercel plan limit.');
   }
   const npmRegistry = new URL(String(input.npmRegistry ?? 'https://registry.npmjs.org/'));
   if (npmRegistry.protocol !== 'https:' || npmRegistry.username || npmRegistry.password || npmRegistry.search || npmRegistry.hash || npmRegistry.port || isIP(npmRegistry.hostname) || !npmRegistry.hostname.includes('.') || /\.(localhost|local|internal|test)$/.test(npmRegistry.hostname)) throw new WorkerProviderError('npmRegistry must be a credential-free public HTTPS registry.');
