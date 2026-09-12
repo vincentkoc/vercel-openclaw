@@ -1,0 +1,61 @@
+name: PoC fix validation
+
+on:
+  push:
+    branches: [ci/vercel-poc-fixes]
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: ${{ matrix.fix }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - fix: resident recovery
+            revision: f976acb7743e68ef358415c866284c22ac467f67
+          - fix: snapshot retention
+            revision: 80a0b01057b9b1982531db0f91a6da9b1459e4e1
+    env:
+      CI: 'true'
+      NEXT_TELEMETRY_DISABLED: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ matrix.revision }}
+          persist-credentials: false
+      - name: Verify source identity
+        env:
+          EXPECTED_REVISION: ${{ matrix.revision }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_REVISION"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '26'
+      - name: Worker install
+        working-directory: worker-provider
+        run: npm ci
+      - name: Worker build and typecheck
+        working-directory: worker-provider
+        run: |
+          npm run build
+          npm run typecheck
+      - name: Worker tests
+        working-directory: worker-provider
+        run: npm test
+      - name: Host install
+        working-directory: host
+        run: npm ci
+      - name: Host tests and lint
+        working-directory: host
+        run: |
+          npm test
+          npm run lint
+      - name: Host build and typecheck
+        working-directory: host
+        run: |
+          npm run build
+          npm run typecheck
