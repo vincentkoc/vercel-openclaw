@@ -17,9 +17,7 @@ jobs:
       matrix:
         include:
           - fix: resident recovery
-            revision: f976acb7743e68ef358415c866284c22ac467f67
-          - fix: snapshot retention
-            revision: 80a0b01057b9b1982531db0f91a6da9b1459e4e1
+            revision: 8ec161aa5055ce5085e37cbf3bfa0ac3c0363fe0
     env:
       CI: 'true'
       NEXT_TELEMETRY_DISABLED: '1'
