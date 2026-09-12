@@ -6,6 +6,8 @@ The host forwards the full Slack event to OpenClaw. Both apply explicit channel/
 
 After a reply, eyes/status clear and both VMs stay running. Same-thread messages reuse the gateway and worker; a new thread reclaims the old worker first. A private resident service holds the active-work guard and resets the idle clock on work. At 45 minutes idle it calls `/api/codex/sleep`. The Function verifies a session-bound capability, takes the same Redis lock as incoming messages, obtains fresh OIDC and asks the resident to recheck activity and prepare sleep. Only a ready OpenClaw suspension and confirmed current-session snapshot count as successful sleep. The next message restores disk, starts new processes and resets the clock.
 
+A failed turn fences the resident and requests that same cleanup on the next timer poll, without waiting 45 minutes. Active work or an unconfirmed cleanup step still blocks sleep; the resident retries cleanup while rejecting new turns. This does not replay the failed event or recover a resident that disappeared before its service started.
+
 This lifecycle revision is locally tested, not yet verified in a new deployed Slack run. Rebuild VM1 with the updated provider and runtime; an old runtime digest cannot run the new host protocol.
 
 ## Prerequisites
